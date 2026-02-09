@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+import os, re, json, subprocess, logging, requests
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+TELEGRAM_TOKEN = "8267317513:AAEJP_an1LSOq4N6oDn-YP9nnH0FpP5ol0M"
+OPENCLAW_HOST = "http://127.0.0.1:18789"
+OPENCLAW_TOKEN = "6b833e046e3c2f36b9aae4c5134ee56bdf4a9a04dc1f054d"
+ROUTER_SCRIPT = "/root/.openclaw/scripts/router_prompt_command.sh"
+SWITCH_MODE_SCRIPT = "/root/.openclaw/scripts/switch_mode.sh"
+PROMPT_DB_SCRIPT = "/root/.openclaw/scripts/prompt_db_v2.py"
+FIXED_PATH = "/root/.nvm/versions/node/v22.22.0/bin:/usr/local/bin:/usr/bin:/bin"
+
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO)
+log = logging.getLogger(__name__)
+
+COMMAND_PATTERNS = [
+    (re.compile(r"^/mode\s+(fast|smart)\s*$", re.I), "mode_switch"),
+    (re.compile(r"^/mode\s*$", re.I), "mode_show"),
+    (re.compile(r"^prompt\s+(.+)$", re.I), "prompt_search"),
+    (re.compile(r"^lihat\s+paket:\s*(.+)$", re.I), "lihat_paket"),
+    (re.compile(r"^pakai:\s*(.+)$", re.I), "pakai_prompt"),
+    (re.compile(r"^list\s+(\S+)\s*$", re.I), "list_category"),
+    (re.compile(r"^list\s*$", re.I), "list_all"),
+    (re.compile(r"^cari:\s*(.+)$", re.I), "cari_prompt"),
+    (re.compile(r"^(?:s|simpan|save):\s*(.+)$", re.I | re.S), "save_prompt"),
+]
+
+def match_command(text):
+    text = text.strip()
+    for pattern, cmd_type in COMMAND_PATTERNS:
+        m = pattern.match(text)
+        if m:
+            return cmd_type, m
+    return None, None
+
+def run_shell(cmd, timeout=30):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+            env=dict(os.environ, PATH=FIXED_PATH))
+        output = result.stdout.strip()
+        if result.returncode != 0 and result.stderr.strip():
+            return output if output else "Error: " + result.stderr.strip()[:500]
+        return output or "(tidak ada output)"
+    except subprocess.TimeoutExpired:
+        return "Timeout (>30 detik)"
+    except FileNotFoundError as e:
+        return "Script tidak ditemukan: " + str(e.filename)
+    except Exception as e:
+        return "Error: " + str(e)
+
+def forward_to_openclaw(user_message, user_id):
+    url = OPENCLAW_HOST + "/v1/chat/completions"
+    headers = {"Authorization": "Bearer " + OPENCLAW_TOKEN, "Content-Type": "application/json"}
+    payload = {"model": "openclaw", "messages": [{"role": "user", "content": user_message}],
+               "user": "telegram-" + user_id, "stream": False}
+    try:
+        log.info("Forwarding to OpenClaw: %s", url)
+        resp = requests.post(url, json=payload, headers=headers, timeout=120)
+        log.info("OpenClaw response status: %d", resp.status_code)
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices", [])
+        if choices:
+            content = choices[0].get("message", {}).get("content", "")
+            return content if content else "(OpenClaw jawaban kosong)"
+        return "(OpenClaw tidak mengembalikan jawaban)"
+    except requests.exceptions.ConnectionError:
+        log.error("OpenClaw gateway unreachable")
+        return "OpenClaw gateway tidak bisa dihubungi"
+    except requests.exceptions.Timeout:
+        return "OpenClaw timeout (>120 detik)"
+    except requests.exceptions.HTTPError as e:
+        log.error("OpenClaw HTTP %d: %s", e.response.status_code, e.response.text[:300])
+        return "OpenClaw error " + str(e.response.status_code)
+    except Exception as e:
+        log.error("Forward error: %s", str(e))
+        return "Error: " + str(e)
+
+def handle_prompt_command(cmd_type, match):
+    if cmd_type == "mode_switch":
+        return run_shell([SWITCH_MODE_SCRIPT, match.group(1).lower()], timeout=60)
+    elif cmd_type == "mode_show":
+        return run_shell([SWITCH_MODE_SCRIPT, "show"])
+    elif cmd_type == "prompt_search":
+        return run_shell([ROUTER_SCRIPT, "prompt " + match.group(1).strip()])
+    elif cmd_type == "lihat_paket":
+        return run_shell([ROUTER_SCRIPT, "lihat paket: " + match.group(1).strip()])
+    elif cmd_type == "pakai_prompt":
+        return run_shell([ROUTER_SCRIPT, "pakai: " + match.group(1).strip()])
+    elif cmd_type == "list_all":
+        return run_shell(["python3", PROMPT_DB_SCRIPT, "list-all"])
+    elif cmd_type == "list_category":
+        return run_shell(["python3", PROMPT_DB_SCRIPT, "list-category", match.group(1).strip()])
+    elif cmd_type == "cari_prompt":
+        return run_shell(["python3", PROMPT_DB_SCRIPT, "search-packs", match.group(1).strip()])
+    elif cmd_type == "save_prompt":
+        raw = match.group(1).strip()
+        if re.search(r"^\d+\)", raw, re.M):
+            return run_shell(["python3", PROMPT_DB_SCRIPT, "save-pack", raw])
+        else:
+            lines = raw.split("\n", 1)
+            title = lines[0].strip()
+            content = lines[1].strip() if len(lines) > 1 else title
+            return run_shell(["python3", PROMPT_DB_SCRIPT, "save", title, content])
+    return "(command tidak dikenali)"
+
+async def handle_message(update, context):
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    user_id = str(update.effective_user.id)
+    log.info("[%s] %s", user_id, text[:80])
+
+    cmd_type, match = match_command(text)
+    if cmd_type:
+        log.info("INTERCEPTED: %s", cmd_type)
+        response = handle_prompt_command(cmd_type, match)
+    else:
+        log.info("FORWARD to OpenClaw")
+        response = forward_to_openclaw(text, user_id)
+
+    if not response:
+        response = "(tidak ada jawaban)"
+    for i in range(0, len(response), 4096):
+        await update.message.reply_text(response[i:i+4096])
+
+async def cmd_help(update, context):
+    await update.message.reply_text(
+        "Prompt DB:\n"
+        "- prompt [topik]\n"
+        "- lihat paket: [slug]\n"
+        "- pakai: [slug]\n"
+        "- list / list [kat]\n"
+        "- cari: [topik]\n"
+        "- S: [isi]\n\n"
+        "Model: /mode | /mode fast | /mode smart\n\n"
+        "Chat biasa = AI + Mem0"
+    )
+
+def main():
+    log.info("Telegram Proxy Bot Starting...")
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("mode", handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    log.info("Polling started")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
