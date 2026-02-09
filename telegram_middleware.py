@@ -429,6 +429,42 @@ def extract_title_from_prompt(text):
     return first_line if first_line else "Prompt " + str(int(time.time()))[-6:]
 
 
+def detect_multi_prompts(text):
+    """Detect and split numbered prompt blocks from text.
+    Returns list of (title, content) tuples or None if not multi-prompt.
+    """
+    # Split by numbered patterns: "1. xxx", "2) xxx", etc.
+    blocks = re.split(r'\n(?=\d+[\.\)]\s)', text.strip())
+    
+    if len(blocks) < 2:
+        return None
+    
+    prompts = []
+    for block in blocks:
+        block = block.strip()
+        if len(block) < 50:
+            continue
+        # Extract title from first line
+        first_line = block.split('\n')[0].strip()[:80]
+        prompts.append((first_line, block))
+    
+    return prompts if len(prompts) >= 2 else None
+
+
+def generate_pack_name(filename_or_text):
+    """Generate a clean pack name from filename or text."""
+    name = filename_or_text
+    # Remove file extensions
+    for ext in [".csv", ".txt", ".md"]:
+        name = name.replace(ext, "")
+    # Clean up
+    name = name.replace("_", " ").replace("-", " ").strip()
+    # Limit length
+    if len(name) > 60:
+        name = name[:57] + "..."
+    return name
+
+
 # === COMMAND PATTERNS ========================================================
 
 COMMAND_PATTERNS = [
@@ -626,7 +662,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # Check if this is a prompt that should be auto-saved
             save_context = ""
-            if is_likely_prompt(text):
+            
+            # First: check for multi-prompt (numbered list)
+            multi = detect_multi_prompts(text)
+            if multi:
+                log.info("Detected MULTI-PROMPT (%d prompts)", len(multi))
+                pack_name = "Pack " + str(int(time.time()))[-6:]
+                # Try to get pack name from first line or category
+                category = categorize_prompt_simple(text)
+                pack_name = category + " Pack"
+                
+                saved_count = 0
+                skipped_count = 0
+                for title, content in multi:
+                    is_dup, _ = check_duplicate(content)
+                    if is_dup:
+                        skipped_count += 1
+                        continue
+                    success, result = await save_prompt_to_notion(title, content, category=category, pack=pack_name)
+                    if success:
+                        saved_count += 1
+                    
+                save_context = "[SISTEM: " + str(saved_count) + " prompt disimpan sebagai pack '" + pack_name + "'. " + str(skipped_count) + " duplikat dilewati.]"
+                await update.message.reply_text(
+                    "\u2705 " + str(saved_count) + " prompt disimpan sebagai pack!\n" +
+                    "\u2500" * 25 + "\n" +
+                    "\U0001f4c1 Pack: " + pack_name + "\n" +
+                    "\U0001f4c1 Kategori: " + category + "\n" +
+                    "\u23ed Dilewati: " + str(skipped_count) + " duplikat"
+                )
+                # Reload cache
+                await load_notion_prompts()
+                
+            elif is_likely_prompt(text):
                 log.info("Detected as PROMPT, checking duplicate...")
                 is_dup, existing_title = check_duplicate(text)
                 
@@ -1046,70 +1114,111 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         content_col = -1
         author_col = -1
 
+        # First pass: collect all rows
+        all_rows = []
         for row in reader:
             if header is None:
                 header = [h.strip().lower() for h in row]
-                # Find the Content column (ESUIT format: Id, UserId, Avatar, Author, Content, ...)
                 for idx, h in enumerate(header):
                     if h == "content":
                         content_col = idx
                     elif h == "author":
                         author_col = idx
-                # Fallback: if no "content" column, use last large-text column
                 if content_col < 0:
                     content_col = min(4, len(header) - 1) if len(header) > 4 else 1
                 log.info("CSV header: %s, content_col=%d, author_col=%d", header, content_col, author_col)
                 continue
+            if row and len(row) > content_col:
+                all_rows.append(row)
 
-            if not row or len(row) <= content_col:
-                skipped += 1
-                continue
+        # Detect main author (most frequent with long content)
+        author_counts = {}
+        for row in all_rows:
+            content = row[content_col].strip()
+            author = row[author_col].strip() if author_col >= 0 and len(row) > author_col else ""
+            if len(content) > 100 and author:
+                author_counts[author] = author_counts.get(author, 0) + 1
+        
+        main_author = max(author_counts, key=author_counts.get) if author_counts else ""
+        log.info("Main author detected: %s (%d prompts)", main_author, author_counts.get(main_author, 0))
 
-            comment_text = row[content_col].strip()
+        # Generate pack name from filename
+        pack_name = generate_pack_name(fname)
+        log.info("Pack name: %s", pack_name)
+
+        # Second pass: save only prompts from main author with >100 chars
+        for row in all_rows:
+            content = row[content_col].strip()
             author = row[author_col].strip() if author_col >= 0 and len(row) > author_col else ""
 
-            if len(comment_text) < 50:
+            # Filter: only main author, content > 100 chars
+            if author != main_author or len(content) < 100:
                 skipped += 1
                 continue
 
-            # Extract title from first line of content
-            first_line = comment_text.split("\n")[0].strip()
+            # Check duplicate
+            is_dup, existing_title = check_duplicate(content)
+            if is_dup:
+                skipped += 1
+                log.info("Duplicate skipped: %s", existing_title)
+                continue
+
+            # Extract title and categorize
+            first_line = content.split("\n")[0].strip()
             title = first_line[:80] if first_line else "Prompt dari " + author
+            category = categorize_prompt_simple(content)
 
-            # Determine category from caption or author
-            category = "Imported from CSV"
-            if author:
-                category = "CSV - " + author
-
-            success, result = await save_prompt_to_notion(title, comment_text, category=category)
+            success, result = await save_prompt_to_notion(title, content, category=category, pack=pack_name)
             if success:
                 saved += 1
                 saved_titles.append(title[:50])
-                log.info("Saved prompt: %s (%d chars)", title[:40], len(comment_text))
+                log.info("Saved prompt: %s | Pack: %s", title[:40], pack_name)
             else:
                 failed += 1
                 log.error("Save failed for '%s': %s", title[:30], result)
     else:
-        # TXT — treat entire file as 1 prompt
-        lines = file_text.strip().split("\n", 1)
-        title = lines[0].strip()[:80]
-        content = file_text.strip()
-        success, result = await save_prompt_to_notion(title, content, category="Imported from File")
-        if success:
-            saved = 1
-            saved_titles.append(title[:50])
+        # TXT — check for multi-prompt
+        multi = detect_multi_prompts(file_text)
+        if multi:
+            pack_name = generate_pack_name(fname)
+            for title, content in multi:
+                is_dup, _ = check_duplicate(content)
+                if is_dup:
+                    skipped += 1
+                    continue
+                category = categorize_prompt_simple(content)
+                success, result = await save_prompt_to_notion(title, content, category=category, pack=pack_name)
+                if success:
+                    saved += 1
+                    saved_titles.append(title[:50])
+                else:
+                    failed += 1
         else:
-            failed = 1
+            # Single prompt
+            lines = file_text.strip().split("\n", 1)
+            title = lines[0].strip()[:80]
+            content = file_text.strip()
+            success, result = await save_prompt_to_notion(title, content, category="Imported from File")
+            if success:
+                saved = 1
+                saved_titles.append(title[:50])
+            else:
+                failed = 1
 
     # Reload cache after saving
     await load_notion_prompts()
 
     sep = "\u2500" * 25
+    pack_info = ""
+    if 'pack_name' in dir() and pack_name:
+        pack_info = "\U0001f4c1 Pack: " + pack_name + "\n"
+    
     report = (
-        "\u2705 Import selesai!\n" + sep + "\n"
+        "\u2705 Import selesai!\n" + sep + "\n" +
+        pack_info +
         "\U0001f4be Disimpan: " + str(saved) + " prompt\n"
         "\u274c Gagal: " + str(failed) + "\n"
-        "\u23ed Dilewati (< 50 char): " + str(skipped) + "\n" + sep + "\n"
+        "\u23ed Dilewati (duplikat/pendek): " + str(skipped) + "\n" + sep + "\n"
     )
     if saved_titles:
         report += "\nPrompt yang disimpan:\n"
