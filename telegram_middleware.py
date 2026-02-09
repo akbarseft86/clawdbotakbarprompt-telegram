@@ -38,6 +38,26 @@ log = logging.getLogger("bot")
 # === NOTION PROMPT CACHE =====================================================
 notion_prompts_cache = []
 
+# Per-user conversation history for contextual responses
+# Format: {user_id: [{"role": "user"/"assistant", "content": "..."}]}
+conversation_history = {}
+MAX_HISTORY = 10  # Keep last 10 messages per user
+
+
+def add_to_history(user_id, role, content):
+    """Add a message to user's conversation history."""
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    conversation_history[user_id].append({"role": role, "content": content})
+    # Keep only last MAX_HISTORY messages
+    if len(conversation_history[user_id]) > MAX_HISTORY:
+        conversation_history[user_id] = conversation_history[user_id][-MAX_HISTORY:]
+
+
+def get_history(user_id):
+    """Get user's conversation history."""
+    return conversation_history.get(user_id, [])
+
 
 async def load_notion_prompts():
     """Load all prompts from Notion DB into memory cache."""
@@ -450,10 +470,42 @@ _natural_search_re = [
 ]
 
 
+# Words that indicate a QUESTION (should go to AI, not command)
+QUESTION_INDICATORS = [
+    "apa", "kenapa", "mengapa", "gimana", "bagaimana", "kapan",
+    "dimana", "siapa", "berapa", "apakah", "bisakah", "boleh",
+    "tolong", "bantu", "jelaskan", "ceritakan", "kasih tau",
+    "what", "why", "how", "when", "where", "who", "which",
+    "can you", "could you", "please", "tell me",
+    "barusan", "tadi", "sebelumnya", "yang tadi", "udah", "sudah",
+]
+
+def is_question_or_conversation(text):
+    """Check if text is a conversational question, not a command."""
+    text_lower = text.lower().strip()
+    
+    # Ends with question mark
+    if text_lower.endswith("?"):
+        return True
+    
+    # Contains question words (beyond just "apa" at start)
+    words = text_lower.split()
+    if len(words) > 2:  # More than 2 words = likely conversational
+        for indicator in QUESTION_INDICATORS:
+            if indicator in text_lower:
+                return True
+    
+    return False
+
+
 def match_command(text):
     text = text.strip()
+    
+    # FIRST: Skip command matching if this looks like a conversational question
+    if is_question_or_conversation(text):
+        return None, None
 
-    # Check natural language patterns FIRST (before formal commands)
+    # Check natural language patterns (before formal commands)
     # This catches "gw punya prompt apa aja", "prompt apa aja", etc.
     if _natural_list_re.match(text):
         return "list_all", None
@@ -492,21 +544,44 @@ def run_shell(cmd, timeout=30):
 
 
 def forward_to_openclaw(user_message, user_id):
-    """Forward chat to OpenClaw Gateway (dengan Mem0 memory + Skills support)."""
+    """Forward chat to OpenClaw Gateway with conversation history."""
     url = OPENCLAW_HOST + "/v1/chat/completions"
     headers = {
         "Authorization": "Bearer " + OPENCLAW_TOKEN,
         "Content-Type": "application/json",
         "x-openclaw-agent-id": "main"
     }
+    
+    # Build messages with conversation history
+    system_msg = {
+        "role": "system",
+        "content": (
+            "Kamu adalah AI assistant di Telegram bot bernama 'Chat Random Akbar'. "
+            "Bot ini punya database prompt di Notion yang bisa dicari dan disimpan otomatis.\n\n"
+            "KEMAMPUAN BOT:\n"
+            "- Simpan prompt otomatis ke Notion (jika user kirim prompt)\n"
+            "- OCR gambar (jika user kirim foto)\n"
+            "- Cari prompt: ketik 'buka [keyword]'\n"
+            "- List semua: ketik 'list'\n\n"
+            "INSTRUKSI:\n"
+            "- Jawab dalam bahasa yang sama dengan user (Indonesia/English)\n"
+            "- Jawab ringkas dan to the point\n"
+            "- Jika ada konteks dari percakapan sebelumnya, gunakan konteks itu\n"
+            "- Kamu BISA melihat dan mengingat percakapan sebelumnya"
+        )
+    }
+    
+    history = get_history(user_id)
+    messages = [system_msg] + history + [{"role": "user", "content": user_message}]
+    
     payload = {
         "model": "openclaw",
-        "messages": [{"role": "user", "content": user_message}],
+        "messages": messages,
         "user": "telegram-" + str(user_id),
         "stream": False
     }
     try:
-        log.info("Forwarding to OpenClaw Gateway")
+        log.info("Forwarding to OpenClaw Gateway (history: %d msgs)", len(history))
         resp = requests.post(url, json=payload, headers=headers, timeout=120)
         log.info("OpenClaw response status: %d", resp.status_code)
         resp.raise_for_status()
@@ -550,12 +625,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             # Check if this is a prompt that should be auto-saved
+            save_context = ""
             if is_likely_prompt(text):
                 log.info("Detected as PROMPT, checking duplicate...")
                 is_dup, existing_title = check_duplicate(text)
                 
                 if is_dup:
                     log.info("Duplicate found: %s", existing_title)
+                    save_context = "[SISTEM: Prompt serupa sudah ada di Notion: " + existing_title + ". Tidak disimpan lagi.]"
                     await update.message.reply_text(
                         "\u26a0\ufe0f Prompt serupa sudah ada di Notion:\n" +
                         "\U0001f4c4 " + existing_title + "\n\n" +
@@ -570,6 +647,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     success, result = await save_prompt_to_notion(title, text, category=category)
                     
                     if success:
+                        save_context = "[SISTEM: Prompt disimpan ke Notion. Judul: " + title + " | Kategori: " + category + " | Slug: " + result + "]"
                         await update.message.reply_text(
                             "\u2705 Prompt disimpan otomatis ke Notion!\n" +
                             "\u2500" * 25 + "\n" +
@@ -580,11 +658,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         log.error("Auto-save failed: %s", result)
             
+            # Add user message to history
+            add_to_history(user_id, "user", text)
+            
+            # Inject save context if prompt was saved
+            if save_context:
+                add_to_history(user_id, "assistant", save_context)
+            
             # Forward to OpenClaw for response
             log.info("FORWARD to OpenClaw")
             response = forward_to_openclaw(text, user_id)
         if not response:
             response = "(tidak ada jawaban)"
+        
+        # Track AI response in history
+        add_to_history(user_id, "assistant", response[:500])
+        
         await _send_long_message(update, response)
         return
 
