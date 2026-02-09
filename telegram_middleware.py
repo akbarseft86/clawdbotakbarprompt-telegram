@@ -314,6 +314,101 @@ def get_notion_prompt_by_slug(slug):
     return None
 
 
+# === AUTO-SAVE PROMPT DETECTION ==============================================
+
+PROMPT_INDICATORS = [
+    "kamu adalah", "you are", "act as", "bertindak sebagai",
+    "buatkan", "generate", "create", "write", "buat",
+    "langkah", "step", "instruksi", "instruction",
+    "template", "prompt", "format output", "output format",
+    "sebagai", "sebagai seorang", "as a", "role:",
+    "task:", "tugas:", "objective:", "tujuan:",
+]
+
+PROMPT_CATEGORIES = [
+    "Landing Page", "Copywriting", "Video AI", "Social Media",
+    "Email Marketing", "SEO", "Coding", "Research", "Business",
+    "Marketing", "Content Creation", "General"
+]
+
+
+def is_likely_prompt(text):
+    """Detect if text is a prompt vs casual chat."""
+    if len(text) < 100:
+        return False
+    
+    text_lower = text.lower()
+    
+    # Check for prompt indicators
+    indicator_count = sum(1 for ind in PROMPT_INDICATORS if ind in text_lower)
+    
+    # Has multiple lines (structured content)
+    line_count = len(text.split('\n'))
+    
+    # Decision: at least 1 indicator OR long structured text
+    return indicator_count >= 1 or (len(text) > 300 and line_count > 3)
+
+
+def check_duplicate(text, threshold=0.7):
+    """Check if similar prompt exists in cache using simple similarity."""
+    from difflib import SequenceMatcher
+    
+    text_lower = text.lower()[:500]
+    
+    for p in notion_prompts_cache:
+        existing = p["content"].lower()[:500]
+        similarity = SequenceMatcher(None, text_lower, existing).ratio()
+        
+        if similarity > threshold:
+            return True, p["title"]
+    
+    return False, None
+
+
+def categorize_prompt_simple(text):
+    """Simple keyword-based categorization."""
+    text_lower = text.lower()
+    
+    category_keywords = {
+        "Landing Page": ["landing page", "hero section", "cta", "above the fold", "conversion"],
+        "Copywriting": ["copywriting", "headline", "hook", "persuasif", "sales copy", "copy"],
+        "Video AI": ["video", "script video", "youtube", "tiktok", "reels", "shorts"],
+        "Social Media": ["instagram", "facebook", "twitter", "linkedin", "social media", "posting"],
+        "Email Marketing": ["email", "newsletter", "subject line", "autoresponder"],
+        "SEO": ["seo", "keyword", "meta description", "backlink", "serp"],
+        "Coding": ["code", "programming", "python", "javascript", "api", "function", "debug"],
+        "Research": ["research", "analisis", "riset", "study", "data"],
+        "Business": ["business", "bisnis", "strategi", "plan", "model"],
+        "Marketing": ["marketing", "funnel", "ads", "iklan", "campaign"],
+        "Content Creation": ["content", "artikel", "blog", "konten", "write"],
+    }
+    
+    for category, keywords in category_keywords.items():
+        if any(kw in text_lower for kw in keywords):
+            return category
+    
+    return "General"
+
+
+def extract_title_from_prompt(text):
+    """Extract a reasonable title from prompt text."""
+    # Get first line, clean it
+    first_line = text.split('\n')[0].strip()
+    
+    # Remove common prefixes
+    prefixes = ["kamu adalah", "you are", "act as", "bertindak sebagai", "buatkan", "buat"]
+    for prefix in prefixes:
+        if first_line.lower().startswith(prefix):
+            first_line = first_line[len(prefix):].strip()
+            break
+    
+    # Limit length
+    if len(first_line) > 60:
+        first_line = first_line[:57] + "..."
+    
+    return first_line if first_line else "Prompt " + str(int(time.time()))[-6:]
+
+
 # === COMMAND PATTERNS ========================================================
 
 COMMAND_PATTERNS = [
@@ -454,6 +549,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Mohon copy-paste isi teks dari link tersebut agar saya bisa membacanya."
             )
         else:
+            # Check if this is a prompt that should be auto-saved
+            if is_likely_prompt(text):
+                log.info("Detected as PROMPT, checking duplicate...")
+                is_dup, existing_title = check_duplicate(text)
+                
+                if is_dup:
+                    log.info("Duplicate found: %s", existing_title)
+                    await update.message.reply_text(
+                        "\u26a0\ufe0f Prompt serupa sudah ada di Notion:\n" +
+                        "\U0001f4c4 " + existing_title + "\n\n" +
+                        "Tidak disimpan lagi untuk menghindari duplikat."
+                    )
+                else:
+                    # Categorize and save
+                    category = categorize_prompt_simple(text)
+                    title = extract_title_from_prompt(text)
+                    
+                    log.info("Auto-saving prompt: %s | Category: %s", title, category)
+                    success, result = await save_prompt_to_notion(title, text, category=category)
+                    
+                    if success:
+                        await update.message.reply_text(
+                            "\u2705 Prompt disimpan otomatis ke Notion!\n" +
+                            "\u2500" * 25 + "\n" +
+                            "\U0001f4c4 Judul: " + title + "\n" +
+                            "\U0001f4c1 Kategori: " + category + "\n" +
+                            "\U0001f3f7\ufe0f Slug: " + result
+                        )
+                    else:
+                        log.error("Auto-save failed: %s", result)
+            
+            # Forward to OpenClaw for response
             log.info("FORWARD to OpenClaw")
             response = forward_to_openclaw(text, user_id)
         if not response:
@@ -736,6 +863,37 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Tips: Pastikan gambar jelas dan ada teks yang bisa dibaca."
         )
         return
+    
+    # Check if OCR'd text is a prompt - auto-save if yes
+    if is_likely_prompt(ocr_text):
+        log.info("OCR detected as PROMPT, checking duplicate...")
+        is_dup, existing_title = check_duplicate(ocr_text)
+        
+        if is_dup:
+            log.info("Duplicate found: %s", existing_title)
+            await update.message.reply_text(
+                "\u26a0\ufe0f Prompt serupa sudah ada di Notion:\n" +
+                "\U0001f4c4 " + existing_title + "\n\n" +
+                "Tidak disimpan lagi untuk menghindari duplikat."
+            )
+        else:
+            # Categorize and save
+            category = categorize_prompt_simple(ocr_text)
+            title = extract_title_from_prompt(ocr_text)
+            
+            log.info("Auto-saving OCR prompt: %s | Category: %s", title, category)
+            success, result = await save_prompt_to_notion(title, ocr_text, category=category)
+            
+            if success:
+                await update.message.reply_text(
+                    "\u2705 Prompt dari gambar disimpan ke Notion!\n" +
+                    "\u2500" * 25 + "\n" +
+                    "\U0001f4c4 Judul: " + title + "\n" +
+                    "\U0001f4c1 Kategori: " + category + "\n" +
+                    "\U0001f3f7\ufe0f Slug: " + result
+                )
+            else:
+                log.error("Auto-save OCR failed: %s", result)
     
     # Build combined message for OpenClaw
     combined = "Ini hasil OCR dari gambar yang dikirim user:\n\n" + ocr_text
