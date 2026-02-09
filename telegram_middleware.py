@@ -7,7 +7,7 @@ Telegram Bot for OpenClaw + Notion Prompt DB
 - /reload  → refresh cache Notion
 - Chat biasa  → forward ke OpenClaw AI
 """
-import os, re, json, subprocess, logging, asyncio
+import os, re, json, subprocess, logging, asyncio, time
 import requests, httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -433,6 +433,7 @@ def forward_to_openclaw(user_message, user_id):
         log.error("Forward error: %s", str(e))
         return "Error: " + str(e)
 
+
 # === MAIN MESSAGE HANDLER ====================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -453,7 +454,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Mohon copy-paste isi teks dari link tersebut agar saya bisa membacanya."
             )
         else:
-            log.info("FORWARD to DeepSeek AI")
+            log.info("FORWARD to OpenClaw")
             response = forward_to_openclaw(text, user_id)
         if not response:
             response = "(tidak ada jawaban)"
@@ -690,6 +691,65 @@ async def _send_long_message(update, text):
         await update.message.reply_text(text)
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo messages - OCR and forward to OpenClaw."""
+    if not update.message.photo:
+        return
+    
+    photo = update.message.photo[-1]  # Highest resolution
+    caption = update.message.caption or ""
+    user_id = str(update.effective_user.id)
+    
+    await update.message.reply_text("\U0001f441 Membaca gambar dengan OCR...")
+    
+    # Download photo to temp file
+    temp_path = "/tmp/telegram_photo_" + user_id + "_" + str(int(time.time())) + ".jpg"
+    
+    try:
+        file = await photo.get_file()
+        await file.download_to_drive(temp_path)
+        log.info("Photo downloaded to %s", temp_path)
+        
+        # Run Tesseract OCR
+        result = subprocess.run(
+            ["tesseract", temp_path, "stdout", "-l", "eng+ind"],
+            capture_output=True, text=True, timeout=30
+        )
+        ocr_text = result.stdout.strip()
+        log.info("OCR result: %d chars", len(ocr_text))
+        
+    except subprocess.TimeoutExpired:
+        await update.message.reply_text("\u23f1 OCR timeout. Gambar terlalu besar.")
+        return
+    except Exception as e:
+        log.error("OCR error: %s", e)
+        await update.message.reply_text("\u274c Error OCR: " + str(e))
+        return
+    finally:
+        # Cleanup temp file
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    
+    if not ocr_text or len(ocr_text) < 5:
+        await update.message.reply_text(
+            "\u274c Tidak dapat membaca teks dari gambar.\n\n"
+            "Tips: Pastikan gambar jelas dan ada teks yang bisa dibaca."
+        )
+        return
+    
+    # Build combined message for OpenClaw
+    combined = "Ini hasil OCR dari gambar yang dikirim user:\n\n" + ocr_text
+    if caption:
+        combined = combined + "\n\nCaption dari user: " + caption
+    combined = combined + "\n\nTolong bantu analisis atau jawab berdasarkan konten ini."
+    
+    # Forward to OpenClaw
+    response = forward_to_openclaw(combined, user_id)
+    
+    # Send response
+    await _send_long_message(update, response)
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle file uploads (CSV, TXT) with caption 'simpan prompt'."""
     import csv, io
@@ -862,6 +922,7 @@ def main():
     app.add_handler(CommandHandler("reload", handle_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     log.info("Polling started")
     app.run_polling(drop_pending_updates=True)
