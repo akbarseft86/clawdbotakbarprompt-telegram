@@ -304,22 +304,26 @@ def search_notion_prompts(query):
         slug_norm = slug_lower.replace(" ", "").replace("-", "")
         category_lower = p.get("category", "").lower()
         category_norm = category_lower.replace(" ", "").replace("-", "")
+        pack_lower = p.get("pack", "").lower()
+        pack_norm = pack_lower.replace(" ", "").replace("-", "")
         content_preview = p["content"].lower()[:500]
 
         # Direct match
         if (query_lower in title_lower or
             query_lower in slug_lower or
             query_lower in category_lower or
+            query_lower in pack_lower or
             query_norm in title_norm or
             query_norm in slug_norm or
             query_norm in category_norm or
+            query_norm in pack_norm or
             query_lower in content_preview):
             results.append(p)
             continue
 
         # Multi-word: all words must match somewhere
         if query_words and len(query_words) > 1:
-            all_text = title_lower + " " + slug_lower + " " + category_lower + " " + content_preview
+            all_text = title_lower + " " + slug_lower + " " + category_lower + " " + pack_lower + " " + content_preview
             if all(w in all_text for w in query_words):
                 results.append(p)
 
@@ -519,14 +523,18 @@ QUESTION_INDICATORS = [
 def is_question_or_conversation(text):
     """Check if text is a conversational question, not a command."""
     text_lower = text.lower().strip()
+    words = text_lower.split()
+    
+    # Very short messages (1-3 words) should go through command matching
+    if len(words) <= 3:
+        return False
     
     # Ends with question mark
     if text_lower.endswith("?"):
         return True
     
-    # Contains question words (beyond just "apa" at start)
-    words = text_lower.split()
-    if len(words) > 2:  # More than 2 words = likely conversational
+    # Contains question/conversation words (only for longer messages)
+    if len(words) > 3:
         for indicator in QUESTION_INDICATORS:
             if indicator in text_lower:
                 return True
